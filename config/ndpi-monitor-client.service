@@ -1,0 +1,17 @@
+[Unit]
+Description=NDPi Monitor Client
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=ndpi-client
+WorkingDirectory=/home/ndpi-client/ndpi-monitor/client
+ExecStart=/usr/bin/node /home/ndpi-client/ndpi-monitor/client/client.js
+Restart=always
+RestartSec=10
+Environment=NODE_ENV=production
+Environment=LD_LIBRARY_PATH=/opt/NDI SDK for Linux/lib/aarch64-rpi4-linux-gnueabi:$LD_LIBRARY_PATH
+
+[Install]
+WantedBy=multi-user.target

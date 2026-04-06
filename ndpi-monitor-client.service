@@ -1,0 +1,16 @@
+[Unit]
+Description=NDPi Monitor Client
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=ndpi-client
+WorkingDirectory=/home/ndpi-client/ndpi-monitor
+ExecStart=/usr/bin/node /home/ndpi-client/ndpi-monitor/client.js
+Restart=always
+RestartSec=10
+Environment=NODE_ENV=production
+
+[Install]
+WantedBy=multi-user.target

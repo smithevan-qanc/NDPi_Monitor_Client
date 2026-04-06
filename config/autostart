@@ -1,0 +1,31 @@
+# Openbox autostart script for NDPi Client Display Kiosk
+
+# Set display
+export DISPLAY=:0
+
+# Disable screen blanking and power management
+xset s off &
+xset -dpms &
+xset s noblank &
+
+# Hide mouse cursor after 2 seconds of inactivity
+unclutter -idle 2 &
+
+# Wait for services to be ready
+sleep 5
+
+# Start Chromium in kiosk mode for client display
+chromium --kiosk \
+    --disable-infobars \
+    --disable-session-crashed-bubble \
+    --disable-component-extensions-with-background-pages \
+    --no-first-run \
+    --disable-default-apps \
+    --disable-translate \
+    --hide-scrollbars \
+    --disable-features=TranslateUI \
+    --noerrdialogs \
+    --disable-web-security \
+    --password-store=basic \
+    --user-data-dir=/home/ndpi-client/.config/chromium-kiosk \
+    http://localhost:8080/display.html &

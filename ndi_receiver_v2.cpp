@@ -1,3 +1,26 @@
+/**
+ * NDI Receiver v2 - NDI SDK v5 with Dynamic Library Loading
+ * 
+ * Features:
+ * - NDI SDK v5 support (recv_capture_v2, audio_frame_v2_t)
+ * - Dynamic library loading - no compile-time linking required
+ * - Automatic display resolution detection (wlr-randr, fbset, drm, env)
+ * - GStreamer pipeline with low-latency optimizations
+ * - Audio conversion from NDI float to 16-bit PCM
+ * 
+ * Compilation:
+ *   g++ -o ndi_receiver_v2 ndi_receiver_v2.cpp \
+ *       $(pkg-config --cflags --libs gstreamer-1.0 gstreamer-app-1.0) \
+ *       -I"/opt/NDI SDK for Linux/include" -ldl -std=c++11
+ * 
+ * Usage:
+ *   ./ndi_receiver_v2 "NDI Source Name"
+ * 
+ * Requirements:
+ * - NDI SDK v5 installed (library will be dynamically loaded)
+ * - GStreamer 1.0 with gst-plugins-base, gst-plugins-good
+ */
+
 #include <iostream>
 #include <string>
 #include <cstring>
@@ -5,9 +28,108 @@
 #include <chrono>
 #include <signal.h>
 #include <cstdlib>
+#include <dlfcn.h>
 #include <gst/gst.h>
 #include <gst/app/gstappsrc.h>
 #include <Processing.NDI.Lib.h>
+
+// NDI SDK v5 Dynamic Loading
+struct NDILib {
+    void* handle = nullptr;
+    
+    // Function pointers for NDI SDK v5
+    bool (*initialize)(void) = nullptr;
+    void (*destroy)(void) = nullptr;
+    const char* (*version)(void) = nullptr;
+    
+    // Receiver functions (v5 uses v3 create, v2 capture)
+    NDIlib_recv_instance_t (*recv_create_v3)(const NDIlib_recv_create_v3_t* p_create_settings) = nullptr;
+    void (*recv_destroy)(NDIlib_recv_instance_t p_instance) = nullptr;
+    void (*recv_connect)(NDIlib_recv_instance_t p_instance, const NDIlib_source_t* p_src) = nullptr;
+    NDIlib_frame_type_e (*recv_capture_v2)(NDIlib_recv_instance_t p_instance, 
+                                            NDIlib_video_frame_v2_t* p_video_data,
+                                            NDIlib_audio_frame_v2_t* p_audio_data,
+                                            NDIlib_metadata_frame_t* p_metadata,
+                                            uint32_t timeout_in_ms) = nullptr;
+    void (*recv_free_video_v2)(NDIlib_recv_instance_t p_instance, const NDIlib_video_frame_v2_t* p_video_data) = nullptr;
+    void (*recv_free_audio_v2)(NDIlib_recv_instance_t p_instance, const NDIlib_audio_frame_v2_t* p_audio_data) = nullptr;
+    
+    // Finder functions
+    NDIlib_find_instance_t (*find_create_v2)(const NDIlib_find_create_t* p_create_settings) = nullptr;
+    void (*find_destroy)(NDIlib_find_instance_t p_instance) = nullptr;
+    bool (*find_wait_for_sources)(NDIlib_find_instance_t p_instance, uint32_t timeout_in_ms) = nullptr;
+    const NDIlib_source_t* (*find_get_current_sources)(NDIlib_find_instance_t p_instance, uint32_t* p_no_sources) = nullptr;
+    
+    // Utility functions
+    void (*util_audio_to_interleaved_16s_v2)(const NDIlib_audio_frame_v2_t* p_src, 
+                                              NDIlib_audio_frame_interleaved_16s_t* p_dst) = nullptr;
+    
+    bool loadLibrary() {
+        // Try to load NDI library from common locations
+        const char* lib_paths[] = {
+            "/usr/local/lib/libndi.dylib",           // macOS Homebrew
+            "/opt/homebrew/lib/libndi.dylib",        // macOS M1/M2 Homebrew
+            "/usr/lib/libndi.so",                    // Linux
+            "/usr/local/lib/libndi.so",              // Linux alt
+            "libndi.dylib",                          // macOS system
+            "libndi.so",                             // Linux system
+            nullptr
+        };
+        
+        for (int i = 0; lib_paths[i] != nullptr; i++) {
+            handle = dlopen(lib_paths[i], RTLD_LAZY | RTLD_LOCAL);
+            if (handle) {
+                std::cout << "Loaded NDI library from: " << lib_paths[i] << std::endl;
+                break;
+            }
+        }
+        
+        if (!handle) {
+            std::cerr << "Failed to load NDI library: " << dlerror() << std::endl;
+            return false;
+        }
+        
+        // Load function pointers
+        #define LOAD_FUNC(name) \
+            name = reinterpret_cast<decltype(name)>(dlsym(handle, "NDIlib_" #name)); \
+            if (!name) { \
+                std::cerr << "Failed to load NDIlib_" #name << ": " << dlerror() << std::endl; \
+                dlclose(handle); \
+                handle = nullptr; \
+                return false; \
+            }
+        
+        LOAD_FUNC(initialize);
+        LOAD_FUNC(destroy);
+        LOAD_FUNC(version);
+        LOAD_FUNC(recv_create_v3);
+        LOAD_FUNC(recv_destroy);
+        LOAD_FUNC(recv_connect);
+        LOAD_FUNC(recv_capture_v2);
+        LOAD_FUNC(recv_free_video_v2);
+        LOAD_FUNC(recv_free_audio_v2);
+        LOAD_FUNC(find_create_v2);
+        LOAD_FUNC(find_destroy);
+        LOAD_FUNC(find_wait_for_sources);
+        LOAD_FUNC(find_get_current_sources);
+        LOAD_FUNC(util_audio_to_interleaved_16s_v2);
+        
+        #undef LOAD_FUNC
+        
+        std::cout << version() << std::endl;
+        return true;
+    }
+    
+    void unloadLibrary() {
+        if (handle) {
+            dlclose(handle);
+            handle = nullptr;
+        }
+    }
+};
+
+// Global NDI library instance
+NDILib g_ndi;
 
 class NDIReceiver {
 private:
@@ -51,18 +173,15 @@ private:
         if (namePipe) {
             char nameBuffer[256];
             if (fgets(nameBuffer, sizeof(nameBuffer), namePipe)) {
-                nameBuffer[strcspn(nameBuffer, "\n")] = 0; // >>>> Remove trailing newline
+                nameBuffer[strcspn(nameBuffer, "\n")] = 0; // Remove trailing newline
                 if (strlen(nameBuffer) > 0) {
                     display_name = nameBuffer;
                 }
             }
             pclose(namePipe);
         }
-        /**
-         * Resolution
-         * wlr-randr
-         * look for 'current'
-         */
+        
+        // Try to get resolution from wlr-randr
         FILE* pipe = popen("wlr-randr 2>/dev/null | grep current | grep -oE '[0-9]+x[0-9]+' | head -1", "r");
         if (pipe) {
             char buffer[128];
@@ -78,13 +197,14 @@ private:
                 }
             }
             pclose(pipe);
+            pipe = nullptr;  // Mark as closed
         }
         
         /**
          * Method 2:
          * fbset for framebuffer
-         */
-        pipe = popen("fbset 2>/dev/null | grep geometry | awk '{print $2 \"x\" $3}'", "r");
+         * /
+        pipe = popen("fbset 2>/dev/null | grep geometry | awk '{print $2 \x\" $3}'", "r");
         if (pipe) {
             char buffer[128];
             if (fgets(buffer, sizeof(buffer), pipe)) {
@@ -98,12 +218,13 @@ private:
                 }
             }
             pclose(pipe);
+            pipe = nullptr;  // Mark as closed
         }
         
         /**
          * Method 3:
          * use '/sys/class/drm' for HDMI
-         */
+         * /
         pipe = popen("cat /sys/class/drm/card?-HDMI-A-1/modes 2>/dev/null | head -1", "r");
         if (pipe) {
             char buffer[128];
@@ -118,12 +239,13 @@ private:
                 }
             }
             pclose(pipe);
+            pipe = nullptr;  // Mark as closed
         }
         
         /**
          * Method 4:
          * Check environment variable 'DISPLAY_RESOLUTION'
-         * Format: Wd.xHt. (e.g. 1920x1080)
+         * Format: WxH (e.g. 1920x1080)
          */
         const char* res = getenv("DISPLAY_RESOLUTION");
         if (res) {
@@ -141,9 +263,9 @@ private:
          * 4K for last resort
          * Maybe change to 2K (2560x1440) if compatibility issues occur frequently
          */
-        display_width = 3840;
-        display_height = 2160;
-        std::cout << "Display: " << display_width << "x" << display_height << " (default 4K)" << std::endl;
+        display_width = 1920;
+        display_height = 1080;
+        std::cout << "Display: " << display_width << "x" << display_height << " (default 1080p)" << std::endl;
     }
     
 public:
@@ -161,21 +283,23 @@ public:
         // Detect display resolution
         detectDisplayResolution();
         
-        // Initialize NDI
-        if (!NDIlib_initialize()) {
+        // Initialize NDI using dynamically loaded library
+        if (!g_ndi.initialize()) {
             throw std::runtime_error("Failed to initialize NDI");
         }
         
-        // Create NDI receiver with v3 struct - LOW LATENCY MODE
+        // Create NDI receiver with v3 struct - LOW LATENCY MODE (SDK v5)
         NDIlib_recv_create_v3_t recv_desc;
         recv_desc.source_to_connect_to.p_ndi_name = nullptr;
         recv_desc.source_to_connect_to.p_url_address = nullptr;
         recv_desc.color_format = NDIlib_recv_color_format_UYVY_RGBA;
+        
+        //recv_desc.bandwidth = NDIlib_recv_bandwidth_lowest;
         recv_desc.bandwidth = NDIlib_recv_bandwidth_highest;
         recv_desc.allow_video_fields = false;  // Disable interlaced - reduces latency
         recv_desc.p_ndi_recv_name = "NDPi-Monitor-Client";
         
-        ndi_recv = NDIlib_recv_create_v3(&recv_desc);
+        ndi_recv = g_ndi.recv_create_v3(&recv_desc);
         if (!ndi_recv) {
             throw std::runtime_error("Failed to create NDI receiver");
         }
@@ -185,9 +309,9 @@ public:
     
     ~NDIReceiver() {
         stop();
-        if (ndi_recv) NDIlib_recv_destroy(ndi_recv);
+        if (ndi_recv) g_ndi.recv_destroy(ndi_recv);
         if (main_loop) g_main_loop_unref(main_loop);
-        NDIlib_destroy();
+        g_ndi.destroy();
     }
     
     bool connectToSource(const std::string& source_name) {
@@ -202,7 +326,7 @@ public:
         find_desc.p_groups = nullptr;
         find_desc.p_extra_ips = nullptr;
         
-        NDIlib_find_instance_t finder = NDIlib_find_create_v2(&find_desc);
+        NDIlib_find_instance_t finder = g_ndi.find_create_v2(&find_desc);
         if (!finder) {
             std::cerr << "Failed to create NDI finder" << std::endl;
             return false;
@@ -216,8 +340,8 @@ public:
         // Wait up to 15 seconds for sources
         auto start_time = std::chrono::high_resolution_clock::now();
         while ((std::chrono::high_resolution_clock::now() - start_time) < std::chrono::seconds(15)) {
-            NDIlib_find_wait_for_sources(finder, 1000);
-            sources = NDIlib_find_get_current_sources(finder, &num_sources);
+            g_ndi.find_wait_for_sources(finder, 1000);
+            sources = g_ndi.find_get_current_sources(finder, &num_sources);
             
             if (num_sources > 0) {
                 std::cout << "Found " << num_sources << " NDI sources:" << std::endl;
@@ -231,9 +355,9 @@ public:
                 if (source_name == sources[i].p_ndi_name) {
                     std::cout << "Found target source: " << source_name << std::endl;
                     // Connect to source
-                    NDIlib_recv_connect(ndi_recv, &sources[i]);
+                    g_ndi.recv_connect(ndi_recv, &sources[i]);
                     current_source = source_name;
-                    NDIlib_find_destroy(finder);
+                    g_ndi.find_destroy(finder);
                     return true;
                 }
             }
@@ -244,7 +368,7 @@ public:
             std::cerr << "  - " << sources[i].p_ndi_name << std::endl;
         }
         
-        NDIlib_find_destroy(finder);
+        g_ndi.find_destroy(finder);
         return false;
     }
     
@@ -367,7 +491,7 @@ private:
         GstElement* appsrc = nullptr;
         
         while (is_running) {
-            switch (NDIlib_recv_capture_v2(ndi_recv, &video_frame, &audio_frame, nullptr, 100)) {
+            switch (g_ndi.recv_capture_v2(ndi_recv, &video_frame, &audio_frame, nullptr, 50)) {
                 case NDIlib_frame_type_video: {
                     // Check if pipeline needs to be created or recreated
                     // (resolution or framerate changed)
@@ -418,7 +542,7 @@ private:
                         gst_buffer_unref(buffer);
                     }
                     
-                    NDIlib_recv_free_video_v2(ndi_recv, &video_frame);
+                    g_ndi.recv_free_video_v2(ndi_recv, &video_frame);
                     break;
                 }
                 case NDIlib_frame_type_audio: {
@@ -437,7 +561,7 @@ private:
                         audio_16s.p_data = (short*)malloc(buffer_size);
 
                         // NDI SDK utility: float planar → interleaved 16-bit PCM
-                        NDIlib_util_audio_to_interleaved_16s_v2(&audio_frame, &audio_16s);
+                        g_ndi.util_audio_to_interleaved_16s_v2(&audio_frame, &audio_16s);
 
                         // Create GStreamer buffer from converted data
                         GstBuffer *buffer = gst_buffer_new_allocate(nullptr, buffer_size, nullptr);
@@ -454,7 +578,7 @@ private:
                         gst_buffer_unref(buffer);
                     }
 
-                    NDIlib_recv_free_audio_v2(ndi_recv, &audio_frame);
+                    g_ndi.recv_free_audio_v2(ndi_recv, &audio_frame);
                     break;
                 }
                 case NDIlib_frame_type_none:
@@ -479,12 +603,19 @@ void signalHandler(int sig) {
         delete g_receiver;
         g_receiver = nullptr;
     }
+    g_ndi.unloadLibrary();
     exit(0);
 }
 
 int main(int argc, char* argv[]) {
     signal(SIGINT, signalHandler);
     signal(SIGTERM, signalHandler);
+    
+    // Load NDI library dynamically
+    if (!g_ndi.loadLibrary()) {
+        std::cerr << "Failed to load NDI library. Please ensure NDI SDK v5 is installed." << std::endl;
+        return 1;
+    }
     
     try {
         g_receiver = new NDIReceiver();
@@ -502,6 +633,7 @@ int main(int argc, char* argv[]) {
                 }
             } else {
                 std::cerr << "Failed to connect to source: " << source_name << std::endl;
+                g_ndi.unloadLibrary();
                 return 1;
             }
         } else {
@@ -513,8 +645,10 @@ int main(int argc, char* argv[]) {
         }
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << std::endl;
+        g_ndi.unloadLibrary();
         return 1;
     }
     
+    g_ndi.unloadLibrary();
     return 0;
 }

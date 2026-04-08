@@ -53,3 +53,7 @@ coverage/
 # Temporary files
 tmp/
 temp/
+
+GitHub-Deploy-Client.sh
+complete-deploy-client.sh
+push-to-git-hub.sh
